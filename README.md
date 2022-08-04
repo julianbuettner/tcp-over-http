@@ -1,8 +1,8 @@
-# TCP over HTTP
+# 📡 TCP over HTTP
 
-## The Questions
+## 🥦 The Questions
 
-### What does it do?
+### 🪃 What does it do?
 You can proxy TCP traffic over HTTP.
 
 An basic setup would be:
@@ -17,7 +17,7 @@ An basic setup would be:
 ```
 
 
-### Why?
+### 🍩 Why?
 ~I was bored.~  
 
 This allows you to reach servers behind a HTTP reverse proxy.  
@@ -27,7 +27,7 @@ If you have for example a HTTP gateway, you can now also have
 a TCP gateway.
 
 
-### Why not?
+### 🍾 Why not?
 Converting binary to base64, send it via HTTP and convert it back is
 inefficient and pretty slow.  
 Less than 10MB/s slow.
@@ -40,7 +40,7 @@ server without him/her knowing.
 This tool is more a proof of concept. Don't take it too serious.
 
 
-## Usage
+## 🎺 Usage
 
 Replace `tcp-over-http` by `cargo run --`
 if you have not installed the binary.
@@ -60,7 +60,7 @@ tcp-over-http entry --target-url http://localhost:8080/
 ssh localhost -p 1415
 ```
 
-## Performance
+## ⌚️ Performance
 
 This package is not optimized for stability or speed.  
 
@@ -80,4 +80,4 @@ tcp-over-http entry --target-url http://localhost:8080/
 time dd if=/dev/random bs=1M count=1024 | pv | nc localhost 1415 -q 0
 ```
 
-### Result: 6MiB/s
+### 🏅 Result: 6MiB/s
