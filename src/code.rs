@@ -1,6 +1,6 @@
 use super::error::ExitNodeError;
 
-pub fn decode(s: String) -> Result<Vec<u8>, ExitNodeError> {
+pub fn decode(s: &str) -> Result<Vec<u8>, ExitNodeError> {
     Ok(base64::decode(s)?)
 }
 

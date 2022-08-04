@@ -92,7 +92,7 @@ async fn download_data<
             body_into_string(res.into_body()).await?,
         )));
     }
-    Ok(decode(body_into_string(res.into_body()).await?)?)
+    Ok(decode(&body_into_string(res.into_body()).await?)?)
 }
 
 async fn process_socket(
