@@ -1,12 +1,11 @@
 use super::code::{decode, encode};
 use super::error::EntryNodeError;
-use hyper::{Body, Client, Method, Request, StatusCode};
+use hyper::{Body, Client, Request, StatusCode};
 use std::io::ErrorKind;
 use std::str::FromStr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
-use tokio::{select, task};
+use tokio::task;
 
 async fn body_into_string(b: Body) -> Result<String, EntryNodeError> {
     Ok(String::from_utf8(hyper::body::to_bytes(b).await?.to_vec()).unwrap())
@@ -99,16 +98,14 @@ async fn download_data<
 async fn process_socket(
     target_url: String,
     socket: tokio::net::TcpStream,
-) -> Result<(), EntryNodeError> {
+) -> Result<u128, EntryNodeError> {
     let mut socket = socket;
     let mut buf: Vec<u8> = vec![0; 1024];
-    // let mut rec_buf: Vec<u8> = vec![0; 1024];
-    let mut continue_loop = true;
     let client = Client::new();
     let uid = init_http_session(&target_url, &client).await?;
     println!("HTTP Server copies. Established session {}", uid);
     let mut download_join_handle = task::spawn(async { Ok(Vec::<u8>::new()) });
-    while continue_loop {
+    loop {
         if download_join_handle.is_finished() {
             let data = match download_join_handle.await {
                 Err(e) => Err(EntryNodeError::f(format!("{:?}", e))),
@@ -160,13 +157,12 @@ async fn process_socket(
             tokio::task::yield_now().await;
         }
     }
-    close_session(&target_url, &client, uid).await?;
-    println!("{:0>3} Connection closed", uid % 1000);
-    Ok(())
+    // close_session(&target_url, &client, uid).await?;
+    // println!("{:0>3} Connection closed", uid % 1000);
+    // Ok(uid)
 }
 
 pub async fn entry_main(bind_ip: std::net::IpAddr, listen_tcp_port: u16, target_url: String) {
-    let mut data = [0u8; 1024];
     let bind_uri = format!("{}:{}", bind_ip, listen_tcp_port);
     let listener_result = TcpListener::bind(&bind_uri).await;
     if let Err(bind_err) = listener_result {
@@ -190,7 +186,7 @@ pub async fn entry_main(bind_ip: std::net::IpAddr, listen_tcp_port: u16, target_
         let (socket, _) = listener.accept().await.unwrap();
         let target_url = target_url.clone();
         let _join_handle = tokio::task::spawn(async {
-            process_socket(target_url, socket).await;
+            let _result = process_socket(target_url, socket).await;
         });
     }
 }

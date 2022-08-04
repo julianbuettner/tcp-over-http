@@ -24,12 +24,13 @@ This allows you to reach servers behind a HTTP reverse proxy.
 Suddenly you can do SSH to a server which is behind a NGINX proxy.
 
 If you have for example a HTTP gateway, you can now also have
-a TCP proxy.
+a TCP gateway.
 
 
 ### Why not?
 Converting binary to base64, send it via HTTP and convert it back is
-pretty slow. Less than 10MB/s slow.
+inefficient and pretty slow.  
+Less than 10MB/s slow.
 
 Also, if a server only opens port 80, nobody expects you
 to tunnel through and rech the SSH server.  
@@ -59,7 +60,9 @@ tcp-over-http entry --target-url http://localhost:8080/
 ssh localhost -p 1415
 ```
 
-## Benchmarks
+## Performance
+
+This package is not optimized for stability or speed.  
 
 _Setup_
 ```bash
@@ -77,8 +80,4 @@ tcp-over-http entry --target-url http://localhost:8080/
 time dd if=/dev/random bs=1M count=1024 | pv | nc localhost 1415 -q 0
 ```
 
-
-### Performance: 6MiB/s
-
-
-
+### Result: 6MiB/s

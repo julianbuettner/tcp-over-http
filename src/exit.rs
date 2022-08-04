@@ -2,27 +2,17 @@ use super::code::{decode, encode};
 use super::error::ExitNodeError;
 use rand::Rng;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 
-struct Config {
-    pub target_host: String,
-    pub target_port: u16,
-}
+struct Config {}
 
 struct ExitSession {
-    pub id: u128,
     pub is_closed: Arc<tokio::sync::Mutex<bool>>,
     pub tcp_stream: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
 }
 
 impl ExitSession {
-    pub async fn close(&self) -> Result<(), ExitNodeError> {
-        let mut guard = self.tcp_stream.lock().await;
-        guard.shutdown().await?;
-        Ok(())
-    }
-
     pub async fn send(&self, buf: Vec<u8>) -> Result<(), ExitNodeError> {
         let mut buf = buf;
         let mut guard = self.tcp_stream.lock().await;
@@ -114,7 +104,6 @@ impl ExitSessionManager {
             uid,
             // Arc::new(tokio::sync::Mutex::new(ExitSession {
             ExitSession {
-                id: uid,
                 is_closed: Arc::new(tokio::sync::Mutex::new(false)),
                 tcp_stream: Arc::new(tokio::sync::Mutex::new(stream)),
             },
@@ -173,7 +162,6 @@ async fn upload(
     data: String,
 ) -> Result<String, ExitNodeError> {
     let http_receive_data = decode(data)?;
-    let http_receive_bytes = http_receive_data.len();
     print!(".");
     manager.send(uid, http_receive_data).await?;
     Ok("".to_string())
@@ -186,7 +174,6 @@ async fn sync(
     data: Option<String>,
 ) -> Result<String, ExitNodeError> {
     let http_receive_data = decode(data.unwrap_or("".to_string()))?;
-    let http_receive_bytes = http_receive_data.len();
     let response_data = manager.send_and_receive(uid, http_receive_data).await?;
     let http_response_data = encode(response_data);
     print!("-");
@@ -226,10 +213,7 @@ pub async fn exit_main(
         ..default_config
     };
     let session_manager = ExitSessionManager::new(format!("{}:{}", target_host, target_port));
-    let config = Config {
-        target_host,
-        target_port,
-    };
+    let config = Config {};
     let _r = rocket::custom(&rocket_config)
         .mount("/", routes![open, sync, upload, close])
         .manage(session_manager)

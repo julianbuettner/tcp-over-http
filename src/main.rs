@@ -1,8 +1,7 @@
 #[macro_use]
 extern crate rocket;
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 mod code;
-mod connectionmanager;
 mod entry;
 mod error;
 mod exit;
