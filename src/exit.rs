@@ -161,7 +161,7 @@ async fn upload(
     uid: u128,
     data: String,
 ) -> Result<String, ExitNodeError> {
-    let http_receive_data = decode(data)?;
+    let http_receive_data = decode(&data)?;
     print!(".");
     manager.send(uid, http_receive_data).await?;
     Ok("".to_string())
@@ -173,7 +173,7 @@ async fn sync(
     uid: u128,
     data: Option<String>,
 ) -> Result<String, ExitNodeError> {
-    let http_receive_data = decode(data.unwrap_or("".to_string()))?;
+    let http_receive_data = decode(data.as_deref().unwrap_or(""))?;
     let response_data = manager.send_and_receive(uid, http_receive_data).await?;
     let http_response_data = encode(response_data);
     print!("-");
