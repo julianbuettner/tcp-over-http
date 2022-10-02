@@ -3,14 +3,31 @@ name = "tcp-over-http"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+rustc_stable = []
+
+[profile.release]
+#https://github.com/flamegraph-rs/flamegraph
+#debug = true
 
 [dependencies]
-rocket = "0.5.0-rc.2"
-tokio = { version = "1.20", features = ["net", "rt"] }
-clap = { version = "3.2.16", features = ["derive"] }
-rand = "0.8"
-async-trait = "0.1.57"
-base64 = "0.13"
-hyper = { version = "0.14.20", features = ["client", "http1", "http2", "tcp"] }
+actix-web = "*"
+tokio = { version = "*", features = ["net", "rt-multi-thread", "macros"] }
+clap = { version = "*", features = ["derive"] }
+reqwest = { version = "*", features = ["stream"] }
+tokio-util = { version = "*", features = ["io", "compat"] }
+futures = "*"
+lazy_static = "*"
+#url = "*"
+anyhow = "*"
+halfbrown = "*"
+uuid = { version = "*", features = ["v4"] }
 
+#log = "*"
+
+bytes = "*"
+
+ouroboros = "*"
+#console-subscriber = "*"
+
+stream-cancel = "*"

@@ -1,65 +1,134 @@
-#[macro_use]
-extern crate rocket;
+#![cfg_attr(
+    not(feature = "rustc_stable"),
+    feature(core_intrinsics, auto_traits, negative_impls, allocator_api)
+)]
+#![allow(clippy::needless_return)]
+#![warn(clippy::pedantic)]
+
 use clap::{Parser, Subcommand};
-mod code;
+use reqwest::Url;
+use std::{convert::Infallible, net::SocketAddr, str::FromStr};
+use tokio::net::lookup_host;
+
 mod entry;
-mod error;
 mod exit;
 
+#[cfg(test)]
+mod tests;
+
+#[cfg(not(feature = "rustc_stable"))]
+mod error;
+
+pub(crate) fn join_url<'a>(base: &Url, path: impl IntoIterator<Item = &'a str>) -> Url {
+    //url::ParseError
+    assert!(base.path().ends_with('/'));
+    let mut it = path.into_iter();
+    let first = it.next().unwrap();
+    let mut next = it.next();
+    if next.is_some() {
+        assert!(first.ends_with('/'));
+    }
+    let mut last = base.join(first).unwrap();
+    while let Some(x) = next {
+        last = last.join(x).unwrap();
+        next = it.next();
+        if next.is_some() {
+            assert!(x.ends_with('/'));
+        }
+    }
+    return last;
+}
+
 #[derive(Clone, Debug, Subcommand)]
-pub enum CommandMode {
+enum CommandMode {
     /// Spin up entry node. Receives incoming TCP and forwards HTTP.
     Entry {
-        #[clap(short, long, value_parser, default_value = "127.0.0.1")]
-        bind_ip: std::net::IpAddr,
+        #[clap(short, long, value_parser, default_value = "localhost:1415")]
+        bind_addr: ResolveAddr,
 
-        #[clap(short = 'p', long, value_parser, default_value = "1415")]
-        listen_tcp_port: u16,
         /// URL of the exit node.
         #[clap(short, long, value_parser)]
-        target_url: String,
+        target_url: Url,
     },
     /// Spin up exit node. Receives incoming HTTP and forwards TCP.
     Exit {
-        #[clap(short, long, value_parser, default_value = "127.0.0.1")]
-        bind_ip: std::net::IpAddr,
+        #[clap(short, long, value_parser, default_value = "localhost:8080")]
+        bind_addr: ResolveAddr,
 
-        #[clap(short = 'l', long, value_parser, default_value = "8080")]
-        listen_http_port: u16,
-        #[clap(short = 't', long, value_parser)]
-        target_host: String,
-        #[clap(short = 'p', long, value_parser)]
-        target_port: u16,
-        #[clap(short = 'd', long, value_parser)]
-        debug: bool,
+        #[clap(short, long)]
+        target_addr: ResolveAddr,
     },
+}
+
+#[derive(Clone, Debug)]
+struct ResolveAddr(String); //lookup_host
+impl FromStr for ResolveAddr {
+    type Err = Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+impl ResolveAddr {
+    async fn resolve(self) -> Vec<SocketAddr> {
+        lookup_host(self.0).await.unwrap().collect::<Vec<_>>()
+    }
 }
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-pub struct CliArgs {
+struct CliArgs {
     #[clap(subcommand)]
     pub mode: CommandMode,
 }
 
+fn set_panic_hook() {
+    let org = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        org(info);
+        std::process::exit(101);
+    }));
+}
+
 #[tokio::main]
 async fn main() {
-    let args = CliArgs::parse();
+    set_panic_hook();
 
-    match args.mode {
+    match CliArgs::parse().mode {
         CommandMode::Entry {
-            bind_ip,
-            listen_tcp_port,
+            bind_addr,
             target_url,
-        } => entry::entry_main(bind_ip, listen_tcp_port, target_url).await,
+        } => entry::main(&bind_addr.resolve().await, target_url).await,
         CommandMode::Exit {
-            bind_ip,
-            listen_http_port,
-            target_host,
-            target_port,
-            debug,
-        } => exit::exit_main(bind_ip, listen_http_port, target_host, target_port, debug).await,
+            bind_addr,
+            target_addr,
+        } => exit::main(&bind_addr.resolve().await, target_addr.resolve().await).await,
     }
+}
 
-    // receiver::receiver_main().await;
+use std::pin::Pin;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::sync::OwnedMutexGuard;
+use tokio_util::codec::{BytesCodec, FramedRead};
+
+#[ouroboros::self_referencing]
+pub(crate) struct Wrapper<T: 'static> {
+    guard: OwnedMutexGuard<T>,
+    #[borrows(mut guard)]
+    #[not_covariant]
+    fr: FramedRead<&'this mut OwnedReadHalf, BytesCodec>,
+}
+
+impl<T: 'static> futures::Stream for Wrapper<T> {
+    type Item = Result<bytes::BytesMut, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.with_fr_mut(|fr| Pin::new(fr).poll_next(cx))
+    }
+}
+
+pub(crate) type Artex<T> = std::sync::Arc<tokio::sync::Mutex<T>>;
+pub(crate) fn artex<T>(t: T) -> Artex<T> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(t))
 }

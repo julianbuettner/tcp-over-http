@@ -1,179 +1,152 @@
-use super::code::{decode, encode};
-use super::error::EntryNodeError;
-use hyper::{Body, Client, Request, StatusCode};
+#![allow(clippy::items_after_statements)]
+
+use crate::ouroboros_impl_wrapper::WrapperBuilder;
+use crate::{artex, join_url};
+
+use bytes::Bytes;
+use futures::TryStreamExt;
+use reqwest::{Body, Client, Response, Url};
+use std::convert::{identity, TryInto};
 use std::io::ErrorKind;
-use std::str::FromStr;
-use tokio::io::AsyncWriteExt;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::task;
+use tokio_util::codec::{BytesCodec, FramedRead};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use uuid::Uuid;
+//use tokio::time::timeout;
 
-async fn body_into_string(b: Body) -> Result<String, EntryNodeError> {
-    Ok(String::from_utf8(hyper::body::to_bytes(b).await?.to_vec()).unwrap())
+lazy_static::lazy_static! {
+    pub(crate) static ref CLIENT: Client = Client::new();
 }
 
-async fn close_session<
-    T: hyper::client::connect::Connect + Clone + std::marker::Send + Sync + 'static,
->(
-    target: &String,
-    client: &Client<T>,
-    uid: u128,
-) -> Result<(), EntryNodeError> {
-    let req = Request::post(&format!("{}close/{}", target, uid))
-        .body(Body::empty())
+async fn close_session(target: &Url, uid: Uuid) {
+    let resp = CLIENT
+        .get(join_url(target, ["close/", &uid.to_string()]))
+        .send()
+        .await
         .unwrap();
-    let res = client.request(req).await?;
-
-    if res.status() != StatusCode::OK {
-        return Err(EntryNodeError::f(format!(
-            "HTTP Exit node error status code: {}\n{:?}",
-            res.status(),
-            body_into_string(res.into_body()).await?,
-        )));
-    }
-    Ok(())
+    assert_ok(resp).await;
 }
-async fn init_http_session<
-    T: hyper::client::connect::Connect + Clone + std::marker::Send + Sync + 'static,
->(
-    target: &String,
-    client: &Client<T>,
-) -> Result<u128, EntryNodeError> {
-    let req = Request::post(&format!("{}open", target))
-        .body(Body::empty())
+async fn init_http_session(target: &Url) -> Uuid {
+    let resp = CLIENT.get(join_url(target, ["open"])).send().await.unwrap();
+    let resp = assert_ok(resp).await;
+    /*use futures::stream::TryStreamExt;
+    let s = resp.bytes_stream();
+    let r = s.map_err(|x| Err(x).unwrap()).into_async_read();
+    let mut r = tokio_util::compat::FuturesAsyncReadCompatExt::compat(r);
+    let mut uid = Uid::zero();
+    r.read_exact(uid.get_mut()).await.unwrap();
+    return uid;*/
+    return Uuid::from_bytes(
+        identity::<&[u8]>(&resp.bytes().await.unwrap())
+            .try_into()
+            .unwrap(),
+    );
+}
+
+async fn upload_data<S>(target: &Url, uid: Uuid, data: S)
+where
+    S: futures::TryStream + Send + Sync + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    bytes::Bytes: From<S::Ok>,
+{
+    let resp = CLIENT
+        .post(join_url(target, ["upload/", &uid.to_string()]))
+        .body(Body::wrap_stream(data))
+        .send()
+        .await
         .unwrap();
-    let res = client.request(req).await?;
-
-    if res.status() != StatusCode::OK {
-        return Err(EntryNodeError::f(format!(
-            "HTTP Exit node error status code: {}\n{:?}",
-            res.status(),
-            body_into_string(res.into_body()).await?,
-        )));
-    }
-    let uid = u128::from_str(&body_into_string(res.into_body()).await?)?;
-    Ok(uid)
+    assert_ok(resp).await;
 }
 
-async fn upload_data<
-    T: hyper::client::connect::Connect + Clone + std::marker::Send + Sync + 'static,
->(
-    target: &String,
-    uid: u128,
-    client: &Client<T>,
-    data: Vec<u8>,
-) -> Result<(), EntryNodeError> {
-    let req = Request::post(&format!("{}u/{}", target, uid))
-        .body(Body::from(encode(data)))
+async fn download_data(
+    target: &Url,
+    uid: Uuid,
+) -> impl futures::Stream<Item = reqwest::Result<Bytes>> {
+    let resp = CLIENT
+        .get(join_url(target, ["download/", &uid.to_string()]))
+        .send()
+        .await
         .unwrap();
-    let res = client.request(req).await?;
-    if res.status() != StatusCode::OK {
-        return Err(EntryNodeError::f(format!(
-            "Failed to upload data to HTTP Server.\n{:?}",
-            body_into_string(res.into_body()).await?,
-        )));
-    }
-    Ok(())
+    let resp = assert_ok(resp).await;
+    return resp.bytes_stream();
 }
 
-async fn download_data<
-    T: hyper::client::connect::Connect + Clone + std::marker::Send + Sync + 'static,
->(
-    target: &String,
-    uid: u128,
-    client: &Client<T>,
-) -> Result<Vec<u8>, EntryNodeError> {
-    let req = Request::post(&format!("{}s/{}", target, uid))
-        .body(Body::empty())
-        .unwrap();
-    let res = client.request(req).await?;
-    if res.status() != StatusCode::OK {
-        return Err(EntryNodeError::f(format!(
-            "Failed to download data from HTTP Server.\n{:?}",
-            body_into_string(res.into_body()).await?,
-        )));
-    }
-    Ok(decode(&body_into_string(res.into_body()).await?)?)
-}
+async fn process_socket(target_url: Arc<Url>, socket: tokio::net::TcpStream) -> Uuid {
+    let uid = init_http_session(&target_url).await;
+    println!("HTTP Server copies. Established session {:#x?}", uid);
 
-async fn process_socket(
-    target_url: String,
-    socket: tokio::net::TcpStream,
-) -> Result<u128, EntryNodeError> {
-    let mut socket = socket;
-    let mut buf: Vec<u8> = vec![0; 1024];
-    let client = Client::new();
-    let uid = init_http_session(&target_url, &client).await?;
-    println!("HTTP Server copies. Established session {}", uid);
-    let mut download_join_handle = task::spawn(async { Ok(Vec::<u8>::new()) });
-    loop {
-        if download_join_handle.is_finished() {
-            let data = match download_join_handle.await {
-                Err(e) => Err(EntryNodeError::f(format!("{:?}", e))),
-                Ok(v) => Ok(v),
-            }??;
-            print!(".");
-            // println!(
-            //     "{:0>3} From HTTP for TCP connection: {}",
-            //     uid % 1000,
-            //     data.len()
-            // );
-            socket.write_all(&data).await.expect("Please never happen");
-            let client = client.clone();
-            let target_url = target_url.clone();
-            download_join_handle = task::spawn(async move {
-                let res = download_data(&target_url, uid, &client).await;
-                res
-            });
-        }
+    let (s_read, mut s_write) = socket.into_split();
 
-        let read_trial = socket.try_read(&mut buf);
-        let bytes_read_count = match read_trial {
-            Ok(0) => {
-                close_session(&target_url, &client, uid).await?;
-                Err(EntryNodeError::f(format!("Read socket closed")))
+    let upload_join = {
+        let target_url = target_url.clone();
+        let s_read = artex(s_read);
+        async move {
+            #[allow(clippy::never_loop)]
+            loop {
+                let stream = WrapperBuilder {
+                    guard: s_read.clone().try_lock_owned().unwrap(),
+                    fr_builder: |a| FramedRead::new(a, BytesCodec::new()),
+                }
+                .build();
+                upload_data(&target_url, uid, stream).await;
+                //200
+                break;
             }
-            Ok(n) => Ok(n),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::task::yield_now().await;
-                Ok(0)
-            }
-            Err(e) => Err(EntryNodeError::f(format!("Sleepdeprevation {:?}", e))),
-        }?;
-        if bytes_read_count > 0 {
-            print!("-");
-            // println!(
-            //     "{:0>3} From TCP to HTTP. Uploading now: {}B",
-            //     uid % 1000,
-            //     bytes_read_count
-            // );
-            upload_data(
-                &target_url,
-                uid,
-                &client,
-                (&buf[0..bytes_read_count]).to_vec(),
-            )
-            .await?;
-        } else {
-            tokio::task::yield_now().await;
         }
-    }
-    // close_session(&target_url, &client, uid).await?;
-    // println!("{:0>3} Connection closed", uid % 1000);
-    // Ok(uid)
+    };
+
+    let download_join = {
+        let target_url = target_url.clone();
+        async move {
+            #[allow(clippy::never_loop)]
+            loop {
+                let s = download_data(&target_url, uid).await;
+                let r = s.map_err(|x| Err(x).unwrap()).into_async_read();
+                let mut r = FuturesAsyncReadCompatExt::compat(r);
+                tokio::io::copy(&mut r, &mut s_write).await.unwrap();
+                break;
+            }
+        }
+    };
+    let upload_join = tokio::spawn(upload_join);
+    let download_join = tokio::spawn(download_join);
+    /*tokio::select!(
+        x = upload_join => {
+            Result::<(), _>::unwrap(x);
+        }
+        x = download_join => {
+            Result::<(), _>::unwrap(x);
+        }
+    );*/
+    let (up, down) = tokio::join!(upload_join, download_join);
+    up.unwrap();
+    down.unwrap();
+    close_session(&target_url, uid).await;
+    return uid;
 }
 
-pub async fn entry_main(bind_ip: std::net::IpAddr, listen_tcp_port: u16, target_url: String) {
-    let bind_uri = format!("{}:{}", bind_ip, listen_tcp_port);
-    let listener_result = TcpListener::bind(&bind_uri).await;
+pub async fn main(bind_addr: &[SocketAddr], target_url: Url) {
+    //console_subscriber::init();
+    let listener_result = TcpListener::bind(bind_addr).await;
     if let Err(bind_err) = listener_result {
         match bind_err.kind() {
-            ErrorKind::AddrInUse => println!("Port {} is already in use.", listen_tcp_port),
-            ErrorKind::AddrNotAvailable => println!("Could not bind to IP {}. Not found.", bind_ip),
-            ErrorKind::PermissionDenied => println!(
-                "Permission denied. Port {} to low for non-root user?",
-                listen_tcp_port
+            ErrorKind::AddrInUse => eprintln!(
+                "Port {:?} is already in use.",
+                bind_addr.iter().map(SocketAddr::port).collect::<Vec<_>>()
             ),
-            e => println!(
+            ErrorKind::AddrNotAvailable => {
+                eprintln!(
+                    "Could not bind to IP {:?}. Not found.",
+                    bind_addr.iter().map(SocketAddr::ip).collect::<Vec<_>>()
+                );
+            }
+            ErrorKind::PermissionDenied => eprintln!(
+                "Permission denied. Port {:?} to low for non-root user?",
+                bind_addr.iter().map(SocketAddr::port).collect::<Vec<_>>()
+            ),
+            e => eprintln!(
                 "Could not listen to your desired ip address or port: {:?}",
                 e
             ),
@@ -181,12 +154,35 @@ pub async fn entry_main(bind_ip: std::net::IpAddr, listen_tcp_port: u16, target_
         return;
     };
     let listener = listener_result.unwrap();
-    println!("Listening on {}", bind_uri);
+    println!("Listening on {}", listener.local_addr().unwrap());
+    let target_url = Arc::new(target_url);
     loop {
         let (socket, _) = listener.accept().await.unwrap();
         let target_url = target_url.clone();
-        let _join_handle = tokio::task::spawn(async {
-            let _result = process_socket(target_url, socket).await;
+        let _join_handle = tokio::spawn(async move {
+            process_socket(target_url, socket).await;
         });
+    }
+}
+
+#[track_caller]
+fn assert_ok(resp: Response) -> impl std::future::Future<Output = Response> {
+    #[cfg(feature = "rustc_stable")]
+    return async move { resp };
+    #[cfg(not(feature = "rustc_stable"))]
+    {
+        let blame_caller = std::intrinsics::caller_location();
+        async move {
+            if resp.status() == reqwest::StatusCode::OK {
+                return resp;
+            }
+            let s = format!("{resp:#?}");
+            let bytes = resp.bytes().await;
+            let resp_body = bytes.as_ref().map(|x| std::str::from_utf8(x));
+            eprintln!("{s}");
+            eprintln!("{resp_body:#?}");
+            eprintln!("caller: {blame_caller}");
+            panic!("status was not ok");
+        }
     }
 }
