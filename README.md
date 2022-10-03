@@ -51,7 +51,7 @@ tcp-over-http --help
 
 # Start our exit node to reach our SSH server (default listen localhost:8080)
 tcp-over-http exit --help
-tcp-over-http exit --target-host localhost --target-port 22
+tcp-over-http exit --target-addr localhost:22
 
 # Start our entry node (default listen localhost:1415)
 tcp-over-http entry --help
