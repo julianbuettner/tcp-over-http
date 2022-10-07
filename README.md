@@ -72,7 +72,7 @@ _Setup_
 nc -l 1234 > /dev/null
 
 # Terminal 1 - Exit Node
-tcp-over-http exit --target-host locahost --target-port 1234
+tcp-over-http exit --target-addr localhost:1234
 
 # Terminal 2 - Entry Node
 tcp-over-http entry --target-url http://localhost:8080/
