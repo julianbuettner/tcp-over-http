@@ -1,0 +1,4 @@
+#[build]
+#rustflags = ["--cfg", "tokio_unstable"]
+[env]
+RUST_TEST_NOCAPTURE = "1"

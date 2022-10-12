@@ -1,227 +1,197 @@
-use super::code::{decode, encode};
-use super::error::ExitNodeError;
-use rand::Rng;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use crate::artex;
+use crate::{ouroboros_impl_wrapper::WrapperBuilder, Artex};
+use actix_web::dev::Server;
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use anyhow::anyhow;
+use futures::stream::TryStreamExt;
+use halfbrown::HashMap as Map;
+use std::net::SocketAddr;
+use stream_cancel::{Trigger, Valve};
+use tokio::{net::TcpStream, sync::RwLock};
+use tokio_util::codec::{BytesCodec, FramedRead};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-struct Config {}
-
-struct ExitSession {
-    pub is_closed: Arc<tokio::sync::Mutex<bool>>,
-    pub tcp_stream: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
+#[derive(Debug)]
+pub(crate) struct UpExitSession {
+    pub(crate) tcp_out: Artex<tokio::net::tcp::OwnedWriteHalf>,
+    pub(crate) stop_copy: CancellationToken,
 }
 
+use derivative::Derivative;
+
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub(crate) struct DownExitSession {
+    pub(crate) tcp_in: Artex<tokio::net::tcp::OwnedReadHalf>,
+    #[derivative(Debug = "ignore")]
+    stream_valve: Valve,
+    #[derivative(Debug = "ignore")]
+    stop_stream: Trigger,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExitSession {
+    pub(crate) up: UpExitSession,
+    pub(crate) down: DownExitSession,
+}
 impl ExitSession {
-    pub async fn send(&self, buf: Vec<u8>) -> Result<(), ExitNodeError> {
-        let mut buf = buf;
-        let mut guard = self.tcp_stream.lock().await;
-        guard.write_all(&mut buf).await?;
-        Ok(())
-    }
-
-    pub async fn send_and_receive(&self, buf: Vec<u8>) -> Result<Vec<u8>, ExitNodeError> {
-        let bytes_to_send = buf.len();
-        // Send first
-        if bytes_to_send > 0 {
-            let mut buf = buf;
-            let mut guard = self.tcp_stream.lock().await;
-            guard.write_all(&mut buf).await?;
-        }
-        // Read
-        let mut response_buf = vec![0u8; 1048576]; // Allocate 1MB
-        let bytes_received = if bytes_to_send == 0 {
-            // There were no bytes to send. If there is nothing to read, wait.
-            let mut break_loop = true;
-            let mut bytes_read_count = 0;
-            while break_loop {
-                let read_trial = {
-                    let guard = self.tcp_stream.lock().await;
-                    guard.try_read(&mut response_buf)
-                };
-                bytes_read_count = match read_trial {
-                    Ok(0) => {
-                        break_loop = false;
-                        Err(ExitNodeError::closed())
-                    }
-                    Ok(n) => {
-                        break_loop = false;
-                        Ok(n)
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        tokio::task::yield_now().await;
-                        Ok(0)
-                    }
-                    Err(e) => Err(e)?,
-                }?;
-                {
-                    let close_guard = self.is_closed.lock().await;
-                    if *close_guard {
-                        println!("Session has been closed by the EntryPoint via HTTP.");
-                        return Err(ExitNodeError::closed());
-                    }
-                }
-            }
-            bytes_read_count
-        } else {
-            // There were bytes to send. If there are no bytes to read, just return.
-            let guard = self.tcp_stream.lock().await;
-            match guard.try_read(&mut response_buf) {
-                Ok(n) => Ok(n),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-                Err(e) => Err(e),
-            }?
-        };
-        response_buf.truncate(bytes_received);
-        Ok(response_buf)
-    }
-}
-
-struct ExitSessionManager {
-    target_string: String,
-    // sessions: Arc<Mutex<HashMap<u128, Arc<tokio::sync::Mutex<ExitSession>>>>>,
-    sessions: Arc<tokio::sync::RwLock<HashMap<u128, ExitSession>>>,
-}
-
-// #[async_trait]
-impl ExitSessionManager {
-    pub fn new(target_string: String) -> Self {
-        Self {
-            target_string,
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            // sessions: HashMap::new(),
-        }
-    }
-
-    async fn new_session(&self) -> Result<u128, ExitNodeError> {
-        let stream = tokio::net::TcpStream::connect(&self.target_string).await?;
-        let uid: u128 = {
-            let mut rng = rand::thread_rng();
-            rng.gen()
-        };
-        let mut guard = self.sessions.write().await;
-        guard.insert(
-            uid,
-            // Arc::new(tokio::sync::Mutex::new(ExitSession {
-            ExitSession {
-                is_closed: Arc::new(tokio::sync::Mutex::new(false)),
-                tcp_stream: Arc::new(tokio::sync::Mutex::new(stream)),
+    fn new(conn: TcpStream) -> Self {
+        let (down, up) = conn.into_split();
+        let (trigger, valve) = Valve::new();
+        ExitSession {
+            up: UpExitSession {
+                tcp_out: artex(up),
+                stop_copy: CancellationToken::new(),
             },
-        );
-        Ok(uid)
+            down: DownExitSession {
+                tcp_in: artex(down),
+                stream_valve: valve,
+                stop_stream: trigger,
+            },
+        }
     }
+}
 
-    async fn close(&self, uid: u128) -> Result<(), ExitNodeError> {
-        {
-            let guard = self.sessions.read().await;
-            let session = guard.get(&uid).ok_or(ExitNodeError::f(format!(
-                "Session with ID {} not found",
-                uid
-            )))?;
-            {
-                let mut guard2 = session.is_closed.lock().await;
-                *guard2 = true;
+#[derive(Debug)]
+pub(crate) struct ExitSessionManager {
+    target_addr: Vec<SocketAddr>,
+    pub(crate) sessions: RwLock<Map<Uuid, ExitSession>>,
+}
+
+impl ExitSessionManager {
+    fn new(target_addr: Vec<SocketAddr>) -> Self {
+        Self {
+            target_addr,
+            sessions: tokio::sync::RwLock::new(Map::new()),
+        }
+    }
+}
+
+#[get("/open")]
+async fn open(manager: web::Data<ExitSessionManager>) -> Vec<u8> {
+    let stream = match TcpStream::connect(manager.target_addr.as_slice()).await {
+        Ok(x) => x,
+        Err(x) => {
+            dbg!(x, "couldnt connect to target");
+            //signal
+            return vec![];
+        }
+    };
+    let uid = Uuid::new_v4();
+    let mut guard = manager.sessions.write().await;
+    guard.insert(uid, ExitSession::new(stream));
+    return uid.into_bytes().to_vec();
+}
+
+#[post("/upload/{uid_s}")]
+async fn upload(
+    manager: web::Data<ExitSessionManager>,
+    uid_s: web::Path<String>,
+    http_receive_data: web::Payload,
+) -> impl Responder {
+    let (guard, stop_copy) = {
+        let uid = Uuid::parse_str(&uid_s).unwrap();
+        let guard = manager.sessions.read().await;
+        let up_sess = &guard
+            .get(&uid)
+            .ok_or_else(|| anyhow!("Session {:#x?} not found!", uid))
+            .unwrap()
+            .up;
+        (
+            up_sess.tcp_out.clone().lock_owned(),
+            up_sess.stop_copy.clone(),
+        )
+    };
+    let r = http_receive_data
+        .map_err(|x| Err(x).unwrap())
+        .into_async_read();
+    let mut r = tokio_util::compat::FuturesAsyncReadCompatExt::compat(r);
+    let tcp_out = &mut *guard.await;
+    return tokio::select! {
+        x = tokio::io::copy(&mut r, tcp_out) => {
+            if let Err(x) = x {
+                dbg!("target disconnect", x);
+                HttpResponse::Ok().body("target disconnect")
+            } else {
+                HttpResponse::Ok().body("finished")
             }
         }
-        let mut guard = self.sessions.write().await;
-        guard.remove(&uid).expect("Please never happen #2");
-
-        Ok(())
-    }
-
-    async fn send_and_receive(&self, uid: u128, buf: Vec<u8>) -> Result<Vec<u8>, ExitNodeError> {
-        // Send first
-        let guard = self.sessions.read().await;
-        let sess = guard
-            .get(&uid)
-            .ok_or(ExitNodeError::f(format!("Session {} not found!", uid)))?;
-
-        // let mut guard = sess.lock().await;
-        sess.send_and_receive(buf).await
-    }
-
-    async fn send(&self, uid: u128, buf: Vec<u8>) -> Result<(), ExitNodeError> {
-        let guard = self.sessions.read().await;
-        let sess = guard
-            .get(&uid)
-            .ok_or(ExitNodeError::f(format!("Session {} not found!", uid)))?;
-        sess.send(buf).await
-    }
-}
-
-#[post("/open")]
-async fn open(manager: &rocket::State<ExitSessionManager>) -> Result<String, ExitNodeError> {
-    let uid = manager.new_session().await?;
-    Ok(uid.to_string())
-}
-
-#[post("/u/<uid>", data = "<data>")]
-async fn upload(
-    manager: &rocket::State<ExitSessionManager>,
-    uid: u128,
-    data: String,
-) -> Result<String, ExitNodeError> {
-    let http_receive_data = decode(&data)?;
-    print!(".");
-    manager.send(uid, http_receive_data).await?;
-    Ok("".to_string())
-}
-
-#[post("/s/<uid>", data = "<data>")]
-async fn sync(
-    manager: &rocket::State<ExitSessionManager>,
-    uid: u128,
-    data: Option<String>,
-) -> Result<String, ExitNodeError> {
-    let http_receive_data = decode(data.as_deref().unwrap_or(""))?;
-    let response_data = manager.send_and_receive(uid, http_receive_data).await?;
-    let http_response_data = encode(response_data);
-    print!("-");
-    // println!(
-    //     "HTTP Received bytes {}, HTTP Upload bytes {}",
-    //     http_receive_bytes,
-    //     http_response_data.len()
-    // );
-    Ok(http_response_data)
-}
-
-#[post("/close/<uid>")]
-async fn close(
-    manager: &rocket::State<ExitSessionManager>,
-    uid: u128,
-) -> Result<String, ExitNodeError> {
-    println!("Close session {}", uid);
-    manager.close(uid).await?;
-    Ok("".to_string())
-}
-
-pub async fn exit_main(
-    bind_ip: std::net::IpAddr,
-    listen_http_port: u16,
-    target_host: String,
-    target_port: u16,
-    debug: bool,
-) {
-    let default_config = if debug {
-        rocket::Config::debug_default()
-    } else {
-        rocket::Config::default()
+        _ = stop_copy.cancelled() => {
+            HttpResponse::Ok().body("cancelled")
+        }
     };
-    let rocket_config = rocket::Config {
-        port: listen_http_port,
-        address: bind_ip,
-        ..default_config
+}
+
+#[get("/download/{uid_s}")]
+async fn download(
+    manager: web::Data<ExitSessionManager>,
+    uid_s: web::Path<String>,
+) -> impl Responder {
+    let (guard, valve) = {
+        let uid = Uuid::parse_str(&uid_s).unwrap();
+        let guard = manager.sessions.read().await;
+        let down_sess = &guard
+            .get(&uid)
+            .ok_or_else(|| anyhow!("Session {:#x?} not found!", uid))
+            .unwrap()
+            .down;
+        (
+            down_sess.tcp_in.clone().lock_owned(),
+            down_sess.stream_valve.clone(),
+        )
     };
-    let session_manager = ExitSessionManager::new(format!("{}:{}", target_host, target_port));
-    let config = Config {};
-    let _r = rocket::custom(&rocket_config)
-        .mount("/", routes![open, sync, upload, close])
-        .manage(session_manager)
-        .manage(config)
-        .ignite()
-        .await
-        .expect("Nope")
-        .launch()
-        .await
-        .expect("Nope nope");
+    let stream = WrapperBuilder {
+        guard: guard.await,
+        fr_builder: |a| FramedRead::new(a, BytesCodec::new()),
+    }
+    .build();
+    let stream = valve.wrap(stream);
+    //BytesMut -> Bytes
+    return HttpResponse::Ok().streaming(stream.map_ok(Into::into));
+}
+
+#[get("/close/{uid_s}")]
+async fn close(manager: web::Data<ExitSessionManager>, uid_s: web::Path<String>) -> impl Responder {
+    let uid = Uuid::parse_str(&uid_s).unwrap();
+    println!("Close session {uid:#x?}");
+    let mut guard = manager.sessions.write().await;
+    let sess = guard
+        .remove(&uid)
+        .ok_or_else(|| anyhow!("Session with ID {uid:#x?} not found"))
+        .unwrap();
+    sess.down.stop_stream.cancel();
+    sess.up.stop_copy.cancel();
+    HttpResponse::Ok()
+}
+
+pub fn main(bind_addr: &[SocketAddr], target_addr: Vec<SocketAddr>) -> (Vec<SocketAddr>, Server) {
+    let session_manager = web::Data::new(ExitSessionManager::new(target_addr));
+    #[cfg(test)]
+    {
+        *test::ARC.try_lock().unwrap() = Some(session_manager.clone());
+    }
+    let x = HttpServer::new(move || {
+        App::new()
+            .app_data(session_manager.clone())
+            //.app_data(web::PayloadConfig::new(1024 * 1024))
+            .service(open)
+            .service(upload)
+            .service(download)
+            .service(close)
+    })
+    .bind(bind_addr)
+    .unwrap();
+    let bound = x.addrs();
+    println!("Listening on {bound:?}");
+    return (bound, x.run());
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use super::ExitSessionManager;
+    use actix_web::web;
+    use tokio::sync::Mutex;
+
+    pub(crate) static ARC: Mutex<Option<web::Data<ExitSessionManager>>> = Mutex::const_new(None);
 }
