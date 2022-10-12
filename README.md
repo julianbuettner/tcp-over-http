@@ -2,7 +2,7 @@
 
 ## 🥦 The Questions
 
-- ### 🪃 What does it do?
+- #### 🪃 What does it do?
 
   You can proxy TCP traffic over HTTP.
 
@@ -17,7 +17,7 @@
   [Your TCP client] --TCP--> [Entry Node]
   ```
 
-- ### 🍩 Why?
+- #### 🍩 Why?
 
   ~~I was bored.~~
 
@@ -27,7 +27,7 @@
   If you have for example a HTTP gateway, you can now also have
   a TCP gateway.
 
-- ### 🍾 Why not?
+- #### 🍾 Why not?
 
   If a server only opens port 80, nobody expects you
   to tunnel through and rech the SSH server.  
