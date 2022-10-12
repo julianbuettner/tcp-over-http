@@ -1,10 +1,18 @@
+//#![allow(warnings)]
 #![cfg_attr(
     not(feature = "rustc_stable"),
-    feature(core_intrinsics, auto_traits, negative_impls, allocator_api)
+    feature(
+        core_intrinsics,
+        auto_traits,
+        negative_impls,
+        panic_internals,
+        panic_info_message
+    )
 )]
 #![allow(clippy::needless_return)]
 #![warn(clippy::pedantic)]
 
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use reqwest::Url;
 use std::{convert::Infallible, net::SocketAddr, str::FromStr};
@@ -70,7 +78,11 @@ impl FromStr for ResolveAddr {
 }
 impl ResolveAddr {
     async fn resolve(self) -> Vec<SocketAddr> {
-        lookup_host(self.0).await.unwrap().collect::<Vec<_>>()
+        lookup_host(&self.0)
+            .await
+            .map_err(|e| anyhow!("{self:#?} - {e:#?}"))
+            .unwrap()
+            .collect::<Vec<_>>()
     }
 }
 
@@ -81,27 +93,38 @@ struct CliArgs {
     pub mode: CommandMode,
 }
 
-fn set_panic_hook() {
-    let org = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        org(info);
-        std::process::exit(101);
-    }));
+fn init_panic_hook() {
+    static ONCE_GUARD: std::sync::Once = std::sync::Once::new();
+    ONCE_GUARD.call_once(|| {
+        let org = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            org(info);
+            std::process::exit(101);
+        }));
+    });
 }
 
 #[tokio::main]
 async fn main() {
-    set_panic_hook();
+    init_panic_hook();
 
     match CliArgs::parse().mode {
         CommandMode::Entry {
             bind_addr,
             target_url,
-        } => entry::main(&bind_addr.resolve().await, target_url).await,
+        } => {
+            entry::main(&bind_addr.resolve().await, target_url)
+                .await
+                .1
+                .await;
+        }
         CommandMode::Exit {
             bind_addr,
             target_addr,
-        } => exit::main(&bind_addr.resolve().await, target_addr.resolve().await).await,
+        } => exit::main(&bind_addr.resolve().await, target_addr.resolve().await)
+            .1
+            .await
+            .unwrap(),
     }
 }
 

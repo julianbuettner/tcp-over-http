@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.checkOnSave.extraArgs": [
+        "--tests"
+    ],
+    "rust-analyzer.checkOnSave.enable": true
+}

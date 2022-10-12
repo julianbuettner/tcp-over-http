@@ -34,7 +34,7 @@
   Security wise, no admin would want this tool on his/her
   server without him/her knowing.
 
-## :) installation
+## 🌲 Installation
 
 - get yourself a rust toolchain via rustup https://www.rust-lang.org/tools/install
 - ```bash
@@ -82,4 +82,4 @@ tcp-over-http entry --target-url http://localhost:8080/
 time cat /dev/zero | pv | nc localhost 1415
 ```
 
-### 🏅 Result: $$$$MiB/s
+### 🏅 Result: 900MiB/s vs 1.3GiB/s (nc | pv > nc)

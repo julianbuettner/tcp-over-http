@@ -1,20 +1,20 @@
-#![allow(clippy::items_after_statements)]
-
+use crate::error::Trace;
 use crate::ouroboros_impl_wrapper::WrapperBuilder;
 use crate::{artex, join_url};
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::Future;
 use reqwest::{Body, Client, Response, Url};
-use std::convert::{identity, TryInto};
+use std::convert::{identity, Infallible, TryInto};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use stream_cancel::Valve;
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-//use tokio::time::timeout;
 
 lazy_static::lazy_static! {
     pub(crate) static ref CLIENT: Client = Client::new();
@@ -28,24 +28,22 @@ async fn close_session(target: &Url, uid: Uuid) {
         .unwrap();
     assert_ok(resp).await;
 }
-async fn init_http_session(target: &Url) -> Uuid {
+async fn init_http_session(target: &Url) -> Trace<Uuid> {
     let resp = CLIENT.get(join_url(target, ["open"])).send().await.unwrap();
     let resp = assert_ok(resp).await;
-    /*use futures::stream::TryStreamExt;
-    let s = resp.bytes_stream();
-    let r = s.map_err(|x| Err(x).unwrap()).into_async_read();
-    let mut r = tokio_util::compat::FuturesAsyncReadCompatExt::compat(r);
-    let mut uid = Uid::zero();
-    r.read_exact(uid.get_mut()).await.unwrap();
-    return uid;*/
-    return Uuid::from_bytes(
-        identity::<&[u8]>(&resp.bytes().await.unwrap())
-            .try_into()
-            .unwrap(),
-    );
+    return Ok(Uuid::from_bytes(
+        match identity::<&[u8]>(&resp.bytes().await.unwrap()).try_into() {
+            Ok(x) => x,
+            Err(x) => {
+                use crate::error::ContextExt;
+                //signal from exit
+                return Err(x.with_context("couldnt connect to target"));
+            }
+        },
+    ));
 }
 
-async fn upload_data<S>(target: &Url, uid: Uuid, data: S)
+async fn upload_req<S>(target: &Url, uid: Uuid, data: S)
 where
     S: futures::TryStream + Send + Sync + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -57,10 +55,11 @@ where
         .send()
         .await
         .unwrap();
-    assert_ok(resp).await;
+    let resp = assert_ok(resp).await;
+    dbg!(resp.text().await.unwrap());
 }
 
-async fn download_data(
+async fn download_req(
     target: &Url,
     uid: Uuid,
 ) -> impl futures::Stream<Item = reqwest::Result<Bytes>> {
@@ -73,13 +72,17 @@ async fn download_data(
     return resp.bytes_stream();
 }
 
-async fn process_socket(target_url: Arc<Url>, socket: tokio::net::TcpStream) -> Uuid {
-    let uid = init_http_session(&target_url).await;
-    println!("HTTP Server copies. Established session {:#x?}", uid);
+async fn process_socket(target_url: Arc<Url>, socket: tokio::net::TcpStream) -> Trace<Uuid> {
+    let uid = init_http_session(&target_url).await?;
+    println!("HTTP Server copies. Established session {uid:#x?}");
 
     let (s_read, mut s_write) = socket.into_split();
 
+    let stop_download = CancellationToken::new();
+    let (stop_upload, valve) = Valve::new();
+
     let upload_join = {
+        let stop_download = stop_download.clone();
         let target_url = target_url.clone();
         let s_read = artex(s_read);
         async move {
@@ -90,10 +93,20 @@ async fn process_socket(target_url: Arc<Url>, socket: tokio::net::TcpStream) -> 
                     fr_builder: |a| FramedRead::new(a, BytesCodec::new()),
                 }
                 .build();
-                upload_data(&target_url, uid, stream).await;
+
+                let stream = stream.map_while::<Result<_, anyhow::Error>, _>(|x| match x {
+                    Ok(x) => Some(Ok(x)),
+                    Err(x) => {
+                        dbg!(x);
+                        None
+                    }
+                });
+                let stream = valve.wrap(stream);
+                upload_req(&target_url, uid, stream).await;
                 //200
                 break;
             }
+            stop_download.cancel();
         }
     };
 
@@ -102,32 +115,43 @@ async fn process_socket(target_url: Arc<Url>, socket: tokio::net::TcpStream) -> 
         async move {
             #[allow(clippy::never_loop)]
             loop {
-                let s = download_data(&target_url, uid).await;
-                let r = s.map_err(|x| Err(x).unwrap()).into_async_read();
-                let mut r = FuturesAsyncReadCompatExt::compat(r);
-                tokio::io::copy(&mut r, &mut s_write).await.unwrap();
+                use futures::TryStreamExt;
+                use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+                let s = download_req(&target_url, uid).await;
+                let mut r = s
+                    .map_while(|x| match x {
+                        Ok(x) => Some(Ok(x)),
+                        Err(x) => {
+                            dbg!(x);
+                            None
+                        }
+                    })
+                    .into_async_read()
+                    .compat();
+
+                tokio::select! {
+                    x = tokio::io::copy(&mut r, &mut s_write) => x.expect("unreachable"),
+                    _ = stop_download.cancelled() => break,
+                };
+
                 break;
             }
+            stop_upload.cancel();
         }
     };
     let upload_join = tokio::spawn(upload_join);
     let download_join = tokio::spawn(download_join);
-    /*tokio::select!(
-        x = upload_join => {
-            Result::<(), _>::unwrap(x);
-        }
-        x = download_join => {
-            Result::<(), _>::unwrap(x);
-        }
-    );*/
-    let (up, down) = tokio::join!(upload_join, download_join);
-    up.unwrap();
-    down.unwrap();
+    upload_join.await.unwrap();
+    download_join.await.unwrap();
     close_session(&target_url, uid).await;
-    return uid;
+    return Ok(uid);
 }
 
-pub async fn main(bind_addr: &[SocketAddr], target_url: Url) {
+pub async fn main(
+    bind_addr: &[SocketAddr],
+    target_url: Url,
+) -> (SocketAddr, impl Future<Output = Infallible>) {
     //console_subscriber::init();
     let listener_result = TcpListener::bind(bind_addr).await;
     if let Err(bind_err) = listener_result {
@@ -151,19 +175,29 @@ pub async fn main(bind_addr: &[SocketAddr], target_url: Url) {
                 e
             ),
         }
-        return;
+        panic!();
     };
     let listener = listener_result.unwrap();
-    println!("Listening on {}", listener.local_addr().unwrap());
+    let bound = listener.local_addr().unwrap();
+    println!("Listening on {bound}");
     let target_url = Arc::new(target_url);
-    loop {
-        let (socket, _) = listener.accept().await.unwrap();
-        let target_url = target_url.clone();
-        let _join_handle = tokio::spawn(async move {
-            process_socket(target_url, socket).await;
-        });
-    }
+    return (bound, async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let target_url = target_url.clone();
+            let _join_handle = tokio::spawn(async move {
+                #[cfg(test)]
+                AC.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(dbg!(process_socket(target_url, socket).await));
+                #[cfg(test)]
+                AC.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    });
 }
+
+#[cfg(test)]
+pub(crate) static AC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[track_caller]
 fn assert_ok(resp: Response) -> impl std::future::Future<Output = Response> {

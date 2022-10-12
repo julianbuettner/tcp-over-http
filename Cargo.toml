@@ -22,12 +22,12 @@ lazy_static = "*"
 anyhow = "*"
 halfbrown = "*"
 uuid = { version = "*", features = ["v4"] }
-
 #log = "*"
-
 bytes = "*"
-
 ouroboros = "*"
 #console-subscriber = "*"
-
 stream-cancel = "*"
+derivative = "*"
+tokio-stream = "*"
+itertools = "*"
+rand = "*"
