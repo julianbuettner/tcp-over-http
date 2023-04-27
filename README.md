@@ -30,7 +30,7 @@
 - #### 🍾 Why not?
 
   If a server only opens port 80, nobody expects you
-  to tunnel through and rech the SSH server.  
+  to tunnel through and reach the SSH server.  
   Security wise, no admin would want this tool on his/her
   server without him/her knowing.
 
