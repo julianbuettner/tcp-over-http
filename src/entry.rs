@@ -20,14 +20,6 @@ lazy_static::lazy_static! {
     pub(crate) static ref CLIENT: Client = Client::new();
 }
 
-fn split_header(line: &str) -> (&str, &str) {
-    let mut iter = line.splitn(2, ": ");
-    (
-        iter.next().unwrap_or(""),
-        iter.next().unwrap_or(""),
-    )
-}
-
 async fn close_session(target: &Url, uid: Uuid) {
     let resp = CLIENT
         .get(join_url(target, ["close/", &uid.to_string()]))
